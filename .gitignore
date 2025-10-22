@@ -119,6 +119,9 @@ user_inputs/*
 # Ignore subfolders in the analysis folder
 src/analysis/decom_files/*
 src/analysis/results/*
-scripts/scratch.py
-model_library/dummy_hydro/pownet_hydropower.csv
-model_library/thailand/pownet_cycle_map.json
+scripts/*
+
+# Pownet generated files
+/model_library/*/pownet_*.csv
+/model_library/*/pownet_*.json
+coverage.json

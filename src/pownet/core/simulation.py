@@ -1,16 +1,15 @@
-""" simulation.py: Main class to run the simulation of the power system model """
+"""simulation.py: Main class to run the simulation of the power system model"""
 
 import pandas as pd
 from pownet.data_utils import (
     create_init_condition,
 )
-from .builder import ModelBuilder
+from .model_builder import ModelBuilder
 from .data_processor import DataProcessor
-from .input import SystemInput
+from ..input import SystemInput
 from .output import OutputProcessor
 from .record import SystemRecord
 from .visualizer import Visualizer
-from ..modeling import PowerSystemModel
 
 
 class Simulator:
@@ -25,6 +24,7 @@ class Simulator:
         use_spin_var: bool = True,
         dc_opf: str = "kirchhoff",
         spin_reserve_factor: float = 0.15,
+        spin_reserve_mw: float = None,
         line_loss_factor: float = 0.075,
         line_capacity_factor: float = 0.9,
         load_shortfall_penalty_factor: float = 1000,
@@ -59,6 +59,7 @@ class Simulator:
         self.use_spin_var: bool = use_spin_var
         self.dc_opf: str = dc_opf
         self.spin_reserve_factor: float = spin_reserve_factor
+        self.spin_reserve_mw: float = spin_reserve_mw
         self.line_loss_factor: float = line_loss_factor
         self.line_capacity_factor: float = line_capacity_factor
         self.load_shortfall_penalty_factor: float = load_shortfall_penalty_factor
@@ -74,6 +75,7 @@ class Simulator:
         self,
         sim_horizon: int,
         steps_to_run: int,
+        num_sim_days: int = 365,
         to_process_inputs: bool = True,
         solver: str = "gurobi",
         log_to_console: bool = True,
@@ -100,7 +102,7 @@ class Simulator:
         """
 
         if steps_to_run is None:
-            steps_to_run = 365 - (sim_horizon // 24 - 1)
+            steps_to_run = num_sim_days - (sim_horizon // 24 - 1)
 
         # To create files with "pownet_" prefix
         if to_process_inputs:
@@ -117,9 +119,11 @@ class Simulator:
             model_name=self.model_name,
             year=self.model_year,
             sim_horizon=sim_horizon,
+            num_sim_days=num_sim_days,
             use_spin_var=self.use_spin_var,
             dc_opf=self.dc_opf,
             spin_reserve_factor=self.spin_reserve_factor,
+            spin_reserve_mw=self.spin_reserve_mw,
             line_loss_factor=self.line_loss_factor,
             line_capacity_factor=self.line_capacity_factor,
             load_shortfall_penalty_factor=self.load_shortfall_penalty_factor,
@@ -134,7 +138,9 @@ class Simulator:
         model_builder = ModelBuilder(self.inputs)
 
         # Initially, all thermal units are off. They have to be switched on from cold start
-        init_conditions = create_init_condition(self.inputs.thermal_units)
+        init_conditions = create_init_condition(
+            self.inputs.thermal_units, self.inputs.storage_units
+        )
 
         for step_k in range(1, steps_to_run + 1):
             # Build or update the model
@@ -168,14 +174,7 @@ class Simulator:
 
     def get_node_variables(self) -> pd.DataFrame:
         """Return the node-specific variables."""
-        output_processor = OutputProcessor(
-            year=self.inputs.year,
-            fuelmap=self.inputs.fuelmap,
-            nodal_hourly_demand=self.inputs.demand,
-        )
-        self.node_variables = self.system_record.get_node_variables()
-        output_processor.load_from_dataframe(self.node_variables)
-        return output_processor.get_node_variables()
+        return self.system_record.get_node_variables()
 
     def get_flow_variables(self) -> pd.DataFrame:
         """Return the flow variables."""
@@ -204,28 +203,26 @@ class Simulator:
                 "Invalid chart type. Choose between 'fuelmix' and 'fuelmix_area'."
             )
 
-        output_processor = OutputProcessor(
-            inputs=self.inputs,
-        )
-        node_var_df = self.system_record.get_node_variables()
-        output_processor.load_from_dataframe(node_var_df)
+        output_processor = OutputProcessor()
+        output_processor.load(self.inputs)
+
+        node_variables = self.system_record.get_node_variables()
 
         visualizer = Visualizer(model_id=self.inputs.model_id)
-
         if chart_type == "bar":
             visualizer.plot_fuelmix_bar(
-                dispatch=output_processor.get_hourly_dispatch(),
-                demand=output_processor.get_hourly_demand(),
+                dispatch=output_processor.get_hourly_generation(node_variables),
+                demand=output_processor.get_hourly_demand(self.inputs.demand),
                 output_folder=output_folder,
             )
         elif chart_type == "area":
             visualizer.plot_fuelmix_area(
-                dispatch=output_processor.get_hourly_dispatch(),
-                demand=output_processor.get_hourly_demand(),
+                dispatch=output_processor.get_hourly_generation(node_variables),
+                demand=output_processor.get_hourly_demand(self.inputs.demand),
                 output_folder=output_folder,
             )
 
-    def plot_unit_status(self, output_folder: str = None) -> None:
+    def plot_thermal_units(self, output_folder: str = None) -> None:
         """Plot the status of the thermal units
 
         Args:
@@ -234,14 +231,17 @@ class Simulator:
         Returns:
             None
         """
-        output_processor = OutputProcessor(
-            inputs=self.inputs,
-        )
-        output_processor.load_from_dataframe(self.system_record.get_node_variables())
+        node_variables = self.system_record.get_node_variables()
+
+        output_processor = OutputProcessor()
+        output_processor.load(self.inputs)
+
         visualizer = Visualizer(model_id=self.inputs.model_id)
         visualizer.plot_thermal_units(
-            unit_status=output_processor.get_unit_status(),
-            thermal_dispatch=output_processor.get_hourly_thermal_dispatch(),
+            unit_status=output_processor.get_thermal_unit_hourly_status(node_variables),
+            thermal_dispatch=output_processor.get_thermal_unit_hourly_dispatch(
+                node_variables
+            ),
             thermal_rated_capacity=self.inputs.thermal_rated_capacity,
             output_folder=output_folder,
         )
@@ -255,72 +255,8 @@ class Simulator:
         Returns:
             None
         """
-        output_processor = OutputProcessor(
-            inputs=self.inputs,
-        )
-        output_processor.load_from_dataframe(self.system_record.get_node_variables())
         visualizer = Visualizer(model_id=self.inputs.model_id)
         visualizer.plot_lmp(
             lmp_df=self.system_record.get_lmp(),
             output_folder=output_folder,
         )
-
-    # def reoperate(
-    #     self,
-    #     k: int,
-    #     builder: ModelBuilder,
-    #     init_conds: dict,
-    #     mip_gap: float = None,
-    #     timelimit: float = None,
-    # ):
-    #     raise NotImplementedError("Reoperation is not implemented yet.")
-    #     reop_converge = False
-    #     reop_k = 0
-    #     while not reop_converge:
-    #         print(f"\nReservoirs reoperation iteration {reop_k}")
-    #         print("New Capacity vs. Current Dispatch")
-
-    #         # PowNet returns the hydropower dispatch in hourly resolution across the simulation horizon
-    #         hydro_dispatch, start_day, end_day = get_hydro_from_model(
-    #             self.model.model, k
-    #         )
-    #         # Convert to daily dispatch
-    #         hydro_dispatch = convert_to_daily_hydro(hydro_dispatch, start_day, end_day)
-    #         new_hydro_capacity = self.reservoir_operator.reoperate_basins(
-    #             pownet_dispatch=hydro_dispatch
-    #         )
-
-    #         for res in new_hydro_capacity.columns:
-    #             print(
-    #                 f"{res}: {round(new_hydro_capacity[res].sum(),2)} vs {round(hydro_dispatch[res].sum(),2)}",
-    #             )
-
-    #         max_deviation = (new_hydro_capacity - hydro_dispatch).abs().max()
-    #         # The tolerance for convergence should be 5% of the largest hydro capacity
-    #         reop_tol = 0.05 * new_hydro_capacity.max()
-    #         if (max_deviation <= reop_tol[max_deviation.index]).all():
-    #             reop_converge = True
-    #             print(f"PowNet: Day {k+1} - Reservoirs converged at iteration {reop_k}")
-
-    #         if reop_k > 50:
-    #             raise ValueError(
-    #                 "Reservoirs reoperation did not converge after 100 iterations"
-    #             )
-
-    #         # To reoptimize PowNet with the new hydropower capacity,
-    #         # update the builder class
-    #         builder.update_hydro_capacity(new_hydro_capacity)
-    #         self.model = builder.update(
-    #             k=k,
-    #             init_conds=init_conds,
-    #             mip_gap=mip_gap,
-    #             timelimit=timelimit,
-    #         )
-    #         self.model.optimize()
-
-    #         # Keep track of optimization time oand reoperation iterations
-    #         self.reop_opt_time += self.model.get_runtime()
-    #         reop_k += 1
-
-    #     # Record the number of iterations after convergence
-    #     self.reop_iter.append(reop_k)

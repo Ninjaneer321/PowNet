@@ -5,34 +5,37 @@ import datetime
 import os
 
 import numpy as np
+import geopandas as gpd
 import pandas as pd
+from shapely.geometry import LineString, Point
+
 from .folder_utils import get_database_dir
 
 
-def get_dates(year):
+def get_dates(year, num_days=365):
     """Return a dataframe of dates for the given year. The dataframe will have
     365 rows, one for each day of the year. The columns are 'date' and 'hour'.
     Exclude 29th February.
     """
     # Create dates to concatenate with the new dataframes
     dates = pd.DataFrame(
-        {"date": pd.date_range(start=str(year), periods=366, freq="D")}
+        {"date": pd.date_range(start=str(year), periods=num_days + 1, freq="D")}
     )
     # Remove 29th Feb because we do not deal with them
     dates = dates.loc[dates.date.dt.strftime("%m-%d") != "02-29"]
     # Remove 1st Jan of the next year in case it is included when it is not a leap year
-    dates = dates.loc[dates.date.dt.strftime("%Y-%m-%d") != f"{year+1}-01-01"]
+    dates = dates.loc[dates.date.dt.strftime("%Y-%m-%d") != f"{year + 1}-01-01"]
 
     # In case we need three columns: date, hour, and day
     dates = dates.loc[dates.index.repeat(24)]
-    dates["hour"] = np.tile(range(1, 25), 365)
+    dates["hour"] = np.tile(range(1, 25), num_days)
     dates = dates.reset_index(drop=True)
     return dates
 
 
 def get_datetime_index(year: int) -> pd.DatetimeIndex:
     """Return a datetime index for the given year. The index will have 8760 entries, one for each hour of the year. Exclude 29th February."""
-    dates = pd.date_range(start=f"{year}-01-01", end=f"{year+1}-01-01", freq="H")
+    dates = pd.date_range(start=f"{year}-01-01", end=f"{year + 1}-01-01", freq="h")
     # Remove 29th February
     dates = dates[~((dates.month == 2) & (dates.day == 29))]
     return dates[dates.year == year]
@@ -56,7 +59,11 @@ def remove_29feb(timeseries: pd.Series) -> pd.Series:
     return cleaned_data
 
 
-def create_init_condition(thermal_units: list) -> dict[(str, int), dict]:
+def create_init_condition(
+    thermal_units: list,
+    storage_units: list = None,
+    ess_max_capacity: dict[str, float] = None,
+) -> dict[(str, int), dict]:
     """Return dicts of system statuses in the format {(unit, hour): value}"""
     # Assume thermal units in the systems are offline at the beginning
     initial_p = {unit_g: 0 for unit_g in thermal_units}
@@ -68,6 +75,17 @@ def create_init_condition(thermal_units: list) -> dict[(str, int), dict]:
     initial_min_on = {unit_g: 0 for unit_g in thermal_units}
     initial_min_off = initial_min_on.copy()
 
+    # Energy storage systems start with zero charge
+    if storage_units is None:
+        initial_charge_state = {}
+    elif len(storage_units) > 0:
+        initial_charge_state = {unit: 0 for unit in storage_units}
+        if ess_max_capacity is not None:
+            for unit in ess_max_capacity:
+                initial_charge_state[unit] = ess_max_capacity[unit]
+    else:
+        initial_charge_state = {}
+
     return {
         "initial_p": initial_p,
         "initial_u": initial_u,
@@ -75,6 +93,7 @@ def create_init_condition(thermal_units: list) -> dict[(str, int), dict]:
         "initial_w": initial_w,
         "initial_min_on": initial_min_on,
         "initial_min_off": initial_min_off,
+        "initial_charge_state": initial_charge_state,
     }
 
 
@@ -88,7 +107,7 @@ def get_node_hour_from_flow_constraint(constraint_name: str) -> tuple[str, int]:
         The node and hour.
 
     """
-    flow_constraint_pattern = re.compile(r"flowBal\[(\w+),(\d+)\]")
+    flow_constraint_pattern = re.compile(r"flowBal\[(.+),(\d+)\]")
     match = flow_constraint_pattern.match(constraint_name)
     if match:
         node = match.group(1)
@@ -98,7 +117,7 @@ def get_node_hour_from_flow_constraint(constraint_name: str) -> tuple[str, int]:
         return None, None
 
 
-def get_unit_hour_from_varnam(var_name: str) -> tuple[str, int]:
+def get_unit_hour_from_varname(var_name: str) -> tuple[str, int]:
     """Get the unit and hour from the variable name.
 
     Args:
@@ -108,7 +127,7 @@ def get_unit_hour_from_varnam(var_name: str) -> tuple[str, int]:
         The unit and hour.
 
     """
-    node_var_pattern = re.compile(r"(\w+)\[(\w+),(\d+)\]")
+    node_var_pattern = re.compile(r"(\w+)\[(.+),(\d+)\]")
     match = node_var_pattern.match(var_name)
     if match:
         unit = match.group(2)
@@ -119,23 +138,25 @@ def get_unit_hour_from_varnam(var_name: str) -> tuple[str, int]:
 
 
 def get_edge_hour_from_varname(var_name: str) -> tuple[tuple[str, str], int]:
-    """Get the edge and hour from the variable name: flow[a,b,t].
+    """Get the edge and hour from the variable name: flow_fwd[a,b,t] or flow_bwd[a,b,t].
 
     Args:
         var_name: The name of the variable.
 
     Returns:
-        The edge and hour.
+        The edge (tuple of two strings) and hour (int).
 
     """
-    edge_var_pattern = re.compile(r"flow\[(\w+),(\w+),(\d+)\]")
+    edge_var_pattern = re.compile(r"flow_(?:fwd|bwd)\[([^,]+),([^,]+),(\d+)\]")
     match = edge_var_pattern.match(var_name)
-    if match:
-        edge = (match.group(1), match.group(2))
-        hour = int(match.group(3))
-        return edge, hour
-    else:
-        raise ValueError("Invalid variable name format")
+    if not match:
+        raise ValueError(f"Invalid variable name format: {var_name}")
+
+    node1 = match.group(1)
+    node2 = match.group(2)
+    hour = int(match.group(3))
+    edge = (node1, node2)
+    return edge, hour
 
 
 def get_current_time() -> str:
@@ -159,6 +180,8 @@ def write_df(
         None
     """
     # First check that the output directory exists. If not, create it.
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
     df.to_csv(
         os.path.join(output_folder, f"{model_id}_{output_name}.csv"),
         index=False,
@@ -275,8 +298,13 @@ def parse_node_variables(
     Returns:
         pd.DataFrame: The node variables DataFrame"""
 
-    node_var_pattern = r"(\w+)\[(\w+),(\d+)\]"
+    node_var_pattern = r"(\w+)\[(.+),(\d+)\]"
     current_node_vars = solution[solution["varname"].str.match(node_var_pattern)].copy()
+
+    # Flow should not be included in the node variables
+    current_node_vars = current_node_vars[
+        ~current_node_vars["vartype"].isin(["flow_fwd", "flow_bwd"])
+        ]
 
     current_node_vars[["node", "timestep"]] = current_node_vars["varname"].str.extract(
         node_var_pattern, expand=True
@@ -302,27 +330,49 @@ def parse_flow_variables(
     solution: pd.DataFrame, sim_horizon: int, step_k: int
 ) -> pd.DataFrame:
     """
-    The flow variables are in the (node, node, t) format.
+    Parses flow variables from the solution DataFrame.
+    The flow variables are expected in the format:
+    flow_fwd[node_a,node_b,t] or flow_bwd[node_a,node_b,t].
 
     Args:
-        solution: The solution DataFrame.
-        sim_horizon: The length of the simulation horizon.
-        step_k: The current simulation period.
+        solution: The solution DataFrame with a 'varname' column.
+        sim_horizon: The length of the simulation horizon for a single step_k (e.g., 24 hours).
+        step_k: The current simulation period (1-indexed).
 
     Returns:
-        pd.DataFrame: The flow variables DataFrame
+        pd.DataFrame: A DataFrame with parsed flow variables, including
+                      columns for 'node_a', 'node_b', 'type' (fwd/bwd),
+                      'value', 'timestep' (relative to step_k), and 'hour' (absolute).
     """
-    flow_var_pattern = r"flow\[(\w+),(\w+),(\d+)\]"
-    cur_flow_vars = solution[solution["varname"].str.match(flow_var_pattern)].copy()
+    # Matches flow_fwd[node_a,node_b,t] or flow_bwd[node_a,node_b,t]
+    # It captures the type (fwd or bwd), node_a, node_b, and t.
+    flow_var_pattern = r"flow_(fwd|bwd)\[([^,]+),([^,]+),(\d+)\]"
 
-    cur_flow_vars[["node_a", "node_b", "timestep"]] = cur_flow_vars[
-        "varname"
-    ].str.extract(flow_var_pattern, expand=True)
+    # Filter rows that match the flow variable pattern
+    flow_vars_mask = solution["varname"].str.contains(
+        r"flow_(?:fwd|bwd)\[.+,.+,\d+\]", regex=True
+    )
+    cur_flow_vars = solution[flow_vars_mask].copy()
 
+    if cur_flow_vars.empty:
+        return pd.DataFrame(
+            columns=["node_a", "node_b", "type", "value", "timestep", "hour"]
+        )
+
+    # Extract components from varname
+    extracted_data = cur_flow_vars["varname"].str.extract(flow_var_pattern, expand=True)
+    cur_flow_vars[["type", "node_a", "node_b", "timestep"]] = extracted_data
+
+    # Convert timestep to integer
     cur_flow_vars["timestep"] = cur_flow_vars["timestep"].astype(int)
+
+    # Calculate absolute hour
+    # Assuming sim_horizon is the number of timesteps within one step_k
+    # and step_k is 1-indexed.
     cur_flow_vars["hour"] = cur_flow_vars["timestep"] + sim_horizon * (step_k - 1)
-    cur_flow_vars = cur_flow_vars.drop("varname", axis=1)
-    return cur_flow_vars
+
+    final_columns = ["node_a", "node_b", "value", "type", "timestep", "hour"]
+    return cur_flow_vars[final_columns]
 
 
 def parse_syswide_variables(
@@ -339,7 +389,7 @@ def parse_syswide_variables(
     Returns:
         pd.DataFrame: The system-wide variables DataFrame
     """
-    syswide_var_pattern = r"(\w+)\[(\d+)\]"
+    syswide_var_pattern = r"(.+)\[(\d+)\]"
     cur_syswide_vars = solution[
         solution["varname"].str.match(syswide_var_pattern)
     ].copy()
@@ -381,7 +431,6 @@ def get_fuel_mix_order() -> list[str]:
 
     Returns
         list[str]: The order of fuel mix.
-    -------
     """
     return pd.read_csv(
         os.path.join(get_database_dir(), "fuels.csv"),
@@ -401,3 +450,51 @@ def get_fuel_color_map() -> dict:
         .to_dict()["color"]
     )
     return fuel_color_map
+
+
+def get_lines_params() -> pd.DataFrame:
+    """Return a dataframe of line parameters, located in database/transmission_params.csv"""
+    return pd.read_csv(
+        os.path.join(get_database_dir(), "transmission_params.csv"),
+        header=0,
+    )
+
+
+def create_geoseries_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["geometry"] = df.apply(
+        lambda row: LineString(
+            [(row["source_lon"], row["source_lat"]), (row["sink_lon"], row["sink_lat"])]
+        ),
+        axis=1,
+    )
+
+    df["source_location"] = df.apply(
+        lambda row: Point(row["source_lon"], row["source_lat"]), axis=1
+    )
+    df["sink_location"] = df.apply(
+        lambda row: Point(row["sink_lon"], row["sink_lat"]), axis=1
+    )
+
+    # Plotting the substations requires columns to be a GeoSeries
+    df["source_location"] = gpd.GeoSeries(df["source_location"])
+    df["sink_location"] = gpd.GeoSeries(df["sink_location"])
+    return df
+
+
+def get_capacity_value(t: int, unit: str, step_k: int, capacity_df) -> float:
+    """Get the capacity value for a given unit and timestep.
+    Args:
+        t: The timestep.
+        unit: The unit name.
+        step_k: The current simulation period.
+        capacity_df: The dataframe containing the capacity values.
+
+    Returns:
+        The capacity value for the given unit and timestep.
+    """
+    hours_per_timestep = 24  # For rolling horizon
+    value = capacity_df.loc[t + (step_k - 1) * hours_per_timestep, unit]
+    if isinstance(value, pd.Series):
+        return value.iloc[0]
+    return value
